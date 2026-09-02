@@ -1,0 +1,8 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+transformers==4.36.2
+torch==2.1.2
+sentence-transformers==2.3.1
+numpy==1.26.3
+pydantic==2.5.3
+loguru==0.7.2

@@ -1,0 +1,233 @@
+services:
+  # ClickHouse - 主存储引擎
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: clickhouse
+    ports:
+      - "8123:8123"  # HTTP
+      - "9000:9000"  # Native
+    volumes:
+      - ./data/clickhouse:/var/lib/clickhouse
+      - ./scripts/init_clickhouse.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      CLICKHOUSE_DB: vector_warehouse
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin123
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - vector-net
+
+  # Redis - 缓存层
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - vector-net
+
+  # MySQL - 示例数据源（模拟企业文档库）
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-source
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: wiki_db
+      MYSQL_USER: flink
+      MYSQL_PASSWORD: flink123
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+      - ./scripts/init_mysql.sql:/docker-entrypoint-initdb.d/init.sql
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --binlog-format=ROW
+      - --log-bin=mysql-bin
+      - --server-id=1
+    networks:
+      - vector-net
+
+  # Flink JobManager
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12-java11
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.mode: EXACTLY_ONCE
+    volumes:
+      - ./flink-jobs:/opt/flink-jobs
+      - ./data/flink-checkpoints:/tmp/flink-checkpoints
+      - ./data/flink-lib:/opt/flink/usrlib
+    networks:
+      - vector-net
+
+  # Flink TaskManager 1
+  flink-taskmanager-1:
+    image: flink:1.18-scala_2.12-java11
+    container_name: flink-taskmanager-1
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+    volumes:
+      - ./flink-jobs:/opt/flink-jobs
+      - ./data/flink-lib:/opt/flink/usrlib
+    networks:
+      - vector-net
+
+  # Flink TaskManager 2
+  flink-taskmanager-2:
+    image: flink:1.18-scala_2.12-java11
+    container_name: flink-taskmanager-2
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+    volumes:
+      - ./flink-jobs:/opt/flink-jobs
+      - ./data/flink-lib:/opt/flink/usrlib
+    networks:
+      - vector-net
+
+  # Embedding 服务（本地模型）
+  embedding-service:
+    build:
+      context: ./embedding-service
+      dockerfile: Dockerfile
+    container_name: embedding-service
+    ports:
+      - "8001:8001"
+    environment:
+      MODEL_NAME: BAAI/bge-large-zh-v1.5
+      BATCH_SIZE: 32
+      MAX_LENGTH: 512
+      DEVICE: cpu  # 如果没有 GPU，改为 cpu
+      HF_ENDPOINT: https://hf-mirror.com  # 使用国内镜像
+    volumes:
+      - ./data/models:/app/models  # 模型缓存
+    networks:
+      - vector-net
+
+  # 查询 API 服务
+  api-service:
+    build:
+      context: ./api-service
+      dockerfile: Dockerfile
+    container_name: api-service
+    ports:
+      - "8000:8000"
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_DB: vector_warehouse
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      EMBEDDING_SERVICE_URL: http://embedding-service:8001
+      LOG_LEVEL: INFO
+    depends_on:
+      - clickhouse
+      - redis
+      - embedding-service
+    volumes:
+      - ./api-service:/app
+    networks:
+      - vector-net
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Prometheus - 指标收集
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - vector-net
+
+  # Grafana - 可视化监控
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: grafana
+    ports:
+      - "9091:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+    volumes:
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./data/grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - clickhouse
+    networks:
+      - vector-net
+
+  # Frontend - Vue 3 前端
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+    depends_on:
+      - clickhouse
+      - api-service
+    networks:
+      - vector-net
+
+networks:
+  vector-net:
+    driver: bridge
+
+volumes:
+  clickhouse-data:
+  redis-data:
+  mysql-data:
+  flink-checkpoints:
+  models-cache:
+  prometheus-data:
+  grafana-data:
